@@ -35,7 +35,7 @@ except ImportError:
 # ==========================================
 # ⚙️ CONFIGURATION & CREDENTIALS
 # ==========================================
-BOT_TOKEN = "8772723392:AAHW11hyO7W3Ri5_wK526nMkl5xX25aBTys"
+BOT_TOKEN = "7962465718:AAHQ31pkxtfLwEkRk9fbOdxG50M6yebU50U"
 
 API_CREDENTIALS = [
     {"api_id": 30283245, "api_hash": "4ff403953f3c0d1911cf1b380ac77b90"},
