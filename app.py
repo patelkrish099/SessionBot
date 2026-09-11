@@ -35,7 +35,7 @@ except ImportError:
 # ==========================================
 # ⚙️ CONFIGURATION & CREDENTIALS
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7962465718:AAHQ31pkxtfLwEkRk9fbOdxG50M6yebU50U")
 
 API_CREDENTIALS = [
     {"api_id": 30283245, "api_hash": "4ff403953f3c0d1911cf1b380ac77b90"},
