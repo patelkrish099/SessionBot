@@ -17,12 +17,12 @@ from telethon.errors import (
     PasswordHashInvalidError, InviteRequestSentError, UserAlreadyParticipantError,
     FreshResetAuthorisationForbiddenError
 )
-from telethon.tl.functions.account import GetAuthorizationsRequest, UpdateProfileRequest, ResetAuthorizationRequest
+from telethon.tl.functions.account import GetAuthorizationsRequest, UpdateProfileRequest, ResetAuthorizationRequest, GetPasswordRequest
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, SendVoteRequest, GetMessagesViewsRequest, SendReactionRequest, GetBotCallbackAnswerRequest
 from telethon.tl.functions.phone import JoinGroupCallRequest, LeaveGroupCallRequest
-from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji, DataJSON
+from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji, DataJSON, User, Channel, Chat
 
 # --- TDATA ENGINE ---
 try:
@@ -35,7 +35,7 @@ except ImportError:
 # ==========================================
 # ⚙️ CONFIGURATION & CREDENTIALS
 # ==========================================
-BOT_TOKEN = "7962465718:AAHQ31pkxtfLwEkRk9fbOdxG50M6yebU50U"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 API_CREDENTIALS = [
     {"api_id": 30283245, "api_hash": "4ff403953f3c0d1911cf1b380ac77b90"},
@@ -43,7 +43,6 @@ API_CREDENTIALS = [
 
 BRAND_NAME = "Oggy"
 MAX_DM_AMOUNT = 50
-AUTO_UPDATE_BIO = f"Purchased From @DeamonOTPBot"
 
 CONCURRENT_CHECKS = 50
 semaphore = asyncio.Semaphore(CONCURRENT_CHECKS)
@@ -52,7 +51,7 @@ job_queue = asyncio.Queue()
 WORK_DIR = "work_dir"
 os.makedirs(WORK_DIR, exist_ok=True)
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -73,6 +72,10 @@ class BotStates(StatesGroup):
     waiting_for_rename = State()
     waiting_for_split = State()
     waiting_for_merge = State()
+    waiting_for_bio = State()
+    waiting_for_name_change = State()
+    waiting_for_broadcast_text = State()
+    waiting_for_broadcast_delay = State()
     
     protect_waiting_for_acc = State()
     protect_waiting_for_hash = State()
@@ -112,7 +115,11 @@ def get_main_menu_kb():
          InlineKeyboardButton(text="🧹 Clear Chats", callback_data="clear_chats_prompt")],
         [InlineKeyboardButton(text="🆕 Create New Sessions", callback_data="create_new_prompt"),
          InlineKeyboardButton(text="🔑 2FA Management", callback_data="2fa_manage_menu")],
-        [InlineKeyboardButton(text="🛡 Device & Security", callback_data="device_sec_menu")],
+        [InlineKeyboardButton(text="🛡 Device & Security", callback_data="device_sec_menu"),
+         InlineKeyboardButton(text="📧 Check Gmail", callback_data="queue_check_gmail")],
+        [InlineKeyboardButton(text="📝 Bio Update", callback_data="bio_update_prompt"),
+         InlineKeyboardButton(text="🏷 Name Change", callback_data="name_change_prompt")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="broadcast_menu")],
         [InlineKeyboardButton(text="✏️ Rename Zip", callback_data="rename_zip"), 
          InlineKeyboardButton(text="🧩 Split Zip", callback_data="split_zip")],
         [InlineKeyboardButton(text="🧷 Merge Zip", callback_data="merge_zip")],
@@ -206,7 +213,32 @@ async def safe_disconnect(client: TelegramClient):
     except Exception: pass
 
 def extract_zip(zip_path, extract_to):
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(extract_to)
+    """Safely extract archives without allowing path traversal."""
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        destination = os.path.realpath(extract_to)
+        for member in zip_ref.infolist():
+            target = os.path.realpath(os.path.join(destination, member.filename))
+            if not target.startswith(destination + os.sep):
+                raise ValueError("Archive contains an unsafe path")
+        zip_ref.extractall(extract_to)
+
+def copy_session_bundle(session_path, destination):
+    """Copy a session and its optional JSON profile together."""
+    os.makedirs(destination, exist_ok=True)
+    shutil.copy2(session_path, os.path.join(destination, os.path.basename(session_path)))
+    json_path = session_path[:-8] + ".json"
+    if os.path.exists(json_path):
+        shutil.copy2(json_path, os.path.join(destination, os.path.basename(json_path)))
+
+def display_account(me):
+    name = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip() or "Unknown"
+    return f"{name} (+{getattr(me, 'phone', None) or 'unknown'})"
+
+def authorization_line(auth, now, removed=False):
+    hours = max(0, (now - auth.date_active).total_seconds() / 3600)
+    place = ", ".join(part for part in [getattr(auth, "city", ""), getattr(auth, "country", "")] if part) or "Unknown location"
+    marker = "❌ REMOVED" if removed else "👀 DETECTED"
+    return f"• {auth.device_model or 'Unknown device'}\n  └ {place} | {hours:.1f}h -> {marker}"
 
 def create_zip(folder_path, output_zip):
     """
@@ -223,18 +255,6 @@ def create_zip(folder_path, output_zip):
                         file_path = os.path.join(root, file)
                         # Write the file directly into the root of the ZIP (flattening)
                         zipf.write(file_path, file)
-
-async def auto_update_bio_task(sessions, extract_dir):
-    for sess in sessions:
-        sess_path = os.path.join(extract_dir, sess)
-        async with semaphore:
-            client = create_client(sess_path)
-            try:
-                await client.connect()
-                if await client.is_user_authorized():
-                    await client(UpdateProfileRequest(about=AUTO_UPDATE_BIO))
-            except Exception: pass
-            finally: await safe_disconnect(client)
 
 # ==========================================
 # 🚀 CORE BACKGROUND WORKERS
@@ -256,6 +276,10 @@ async def background_worker():
             elif job_type == "mass_view": await execute_mass_view(call, state, status_msg)
             elif job_type == "mass_react": await execute_mass_react(call, state, status_msg)
             elif job_type == "mass_vc": await execute_mass_vc(call, state, status_msg)
+            elif job_type == "check_gmail": await process_check_gmail(call, state, status_msg)
+            elif job_type == "bio_update": await process_bio_update(call, state, status_msg)
+            elif job_type == "name_change": await process_name_change(call, state, status_msg)
+            elif job_type == "broadcast": await process_broadcast(call, state, status_msg)
         except Exception as e:
             print(f"Job Error: {e}")
         finally:
@@ -293,8 +317,6 @@ async def cancel_action(call: CallbackQuery, state: FSMContext):
             f"⚙️ **Format:** `Telethon / TData`\n"
             f"👤 **Accounts:** `{len(sessions)}`\n"
             f"🛡️ **Status:** `Secured & Ready`\n\n"
-            f"*⚡ Tasks:*\n"
-            f"└ ♻️ Update: `Running...`\n\n"
             f"🚀 *Powered by {BRAND_NAME}*"
         )
         await state.set_state(BotStates.in_main_menu)
@@ -421,27 +443,49 @@ async def process_2fa_login(message: Message, state: FSMContext):
 # ==========================================
 @router.message(F.document)
 async def handle_global_document(message: Message, state: FSMContext):
-    if not message.document.file_name.endswith('.zip'): 
-        return await message.answer("❌ Please send a valid .zip file.")
-
+    filename = message.document.file_name or "session_upload"
     current_state = await state.get_state()
     if current_state == BotStates.waiting_for_merge.state:
         return await process_merge(message, state)
+    if not (filename.lower().endswith(".zip") or filename.lower().endswith(".session")):
+        return await message.answer("❌ Send a Telegram `.session` file or a ZIP containing sessions.", parse_mode="Markdown")
 
-    msg = await message.answer("📥 Downloading and extracting zip...")
+    msg = await message.answer("📥 Preparing your session package…")
     user_dir = os.path.join(WORK_DIR, str(message.from_user.id))
     if os.path.exists(user_dir): shutil.rmtree(user_dir)
     os.makedirs(user_dir, exist_ok=True)
 
-    zip_path = os.path.join(user_dir, "sessions.zip")
-    await bot.download(message.document, destination=zip_path)
-    
+    upload_path = os.path.join(user_dir, filename)
+    await bot.download(message.document, destination=upload_path)
     extract_dir = os.path.join(user_dir, "extracted")
-    try: await asyncio.to_thread(extract_zip, zip_path, extract_dir)
-    except Exception as e: return await msg.edit_text(f"❌ Failed to extract zip. Corrupted?\nError: {e}")
+    os.makedirs(extract_dir, exist_ok=True)
+    try:
+        if filename.lower().endswith(".zip"):
+            await asyncio.to_thread(extract_zip, upload_path, extract_dir)
+        else:
+            # A raw session is normalized into the same package structure as ZIP uploads.
+            shutil.copy2(upload_path, os.path.join(extract_dir, os.path.basename(filename)))
+    except (OSError, zipfile.BadZipFile, ValueError) as exc:
+        return await msg.edit_text(f"❌ The uploaded package could not be read: {exc}")
 
-    # 1. Grab native .sessions
-    sessions = [f for f in os.listdir(extract_dir) if f.endswith('.session')]
+    sessions = []
+    for root, _, files in os.walk(extract_dir):
+        for file in files:
+            if file.endswith('.session'):
+                source = os.path.join(root, file)
+                destination = os.path.join(extract_dir, file)
+                if source != destination:
+                    base, ext = os.path.splitext(file)
+                    counter = 1
+                    while os.path.exists(destination):
+                        destination = os.path.join(extract_dir, f"{base}_{counter}{ext}")
+                        counter += 1
+                    shutil.copy2(source, destination)
+                    source_json = os.path.splitext(source)[0] + '.json'
+                    if os.path.exists(source_json):
+                        shutil.copy2(source_json, os.path.splitext(destination)[0] + '.json')
+                sessions.append(os.path.basename(destination))
+    sessions = sorted(set(sessions))
     
     # 2. TData Decryption Engine
     tdata_folders = []
@@ -467,8 +511,6 @@ async def handle_global_document(message: Message, state: FSMContext):
 
     if not sessions: return await msg.edit_text("❌ No .session files or valid TData found inside this zip!")
 
-    asyncio.create_task(auto_update_bio_task(sessions, extract_dir))
-
     zip_id = random.randint(1000, 9999)
     await state.update_data(user_dir=user_dir, extract_dir=extract_dir, sessions=sessions, zip_id=zip_id)
     await state.set_state(BotStates.in_main_menu)
@@ -480,8 +522,6 @@ async def handle_global_document(message: Message, state: FSMContext):
         f"⚙️ **Format:** `Telethon / TData`\n"
         f"👤 **Accounts:** `{len(sessions)}`\n"
         f"🛡️ **Status:** `Secured & Ready`\n\n"
-        f"*⚡ Background Tasks:*\n"
-        f"└ Update: `Running...`\n\n"
         f"🚀 *Powered by {BRAND_NAME}*"
     )
     try: await msg.edit_text(text, reply_markup=get_main_menu_kb(), parse_mode="Markdown")
@@ -523,7 +563,11 @@ async def add_to_queue(call: CallbackQuery, state: FSMContext):
         "check_age": "Checking Age via @TGDNAbot", 
         "destroy_session": "Destroying Sessions", 
         "clear_chats": "Clearing Chats",
-        "terminate_others": "Terminating Other Devices"
+        "terminate_others": "Terminating Other Devices",
+        "check_gmail": "Checking Gmail connections",
+        "bio_update": "Updating bios",
+        "name_change": "Updating names",
+        "broadcast": "Delivering broadcast"
     }
     action_text = actions.get(job_type, "Processing")
     status_msg = await call.message.edit_text(f"⏳ **{action_text}**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown")
@@ -569,57 +613,68 @@ async def process_check_sessions(call: CallbackQuery, state: FSMContext, status_
     if os.listdir(out_active):
         zip_path = os.path.join(user_dir, "Active_Sessions.zip")
         await asyncio.to_thread(create_zip, out_active, zip_path)
-        await call.message.answer_document(FSInputFile(zip_path))
+        await call.message.answer_document(FSInputFile(zip_path), caption="✅ Valid Sessions")
     if os.listdir(out_dead):
-        zip_path = os.path.join(user_dir, "Dead_Sessions.zip")
+        zip_path = os.path.join(user_dir, "Invalid_Sessions.zip")
         await asyncio.to_thread(create_zip, out_dead, zip_path)
-        await call.message.answer_document(FSInputFile(zip_path))
-        
-    await call.message.answer("✅ Checking complete.", reply_markup=get_back_kb())
+        await call.message.answer_document(FSInputFile(zip_path), caption="❌ Invalid Sessions")
+    valid = sum(1 for file in os.listdir(out_active) if file.endswith(".session"))
+    invalid = sum(1 for file in os.listdir(out_dead) if file.endswith(".session"))
+    await call.message.answer(f"✅ Session check complete.\n🟢 Valid: {valid}\n🔴 Invalid: {invalid}", reply_markup=get_back_kb())
 
 async def process_check_spam(call: CallbackQuery, state: FSMContext, status_msg: Message):
+    """Classify every usable session from @SpamBot's current response."""
     data = await state.get_data()
     extract_dir, user_dir = data['extract_dir'], data['user_dir']
-    dirs = {k: os.path.join(user_dir, k) for k in ['Spamfree', 'Spam', 'Failed']}
-    for d in dirs.values(): os.makedirs(d, exist_ok=True)
+    labels = {
+        "Frozen_Sessions": "❄️ Frozen Sessions",
+        "Spam_Accounts": "🚫 Spam Accounts",
+        "Spam_Free_Accounts": "🟢 Spam-Free Accounts",
+        "Temporary_Spam_Accounts": "⚠️ Temporary Spam Accounts",
+    }
+    dirs = {key: os.path.join(user_dir, key) for key in labels}
+    for folder in dirs.values(): os.makedirs(folder, exist_ok=True)
+    tracker = ProgressTracker(status_msg, len(data['sessions']), "Checking Spam")
 
-    sessions = data['sessions']
-    tracker = ProgressTracker(status_msg, len(sessions), "Checking Spam")
+    def classify(text):
+        value = (text or "").lower()
+        if any(term in value for term in ("frozen", "deactivated", "deleted")): return "Frozen_Sessions"
+        if any(term in value for term in ("good news", "no limits", "not limited")): return "Spam_Free_Accounts"
+        if any(term in value for term in ("temporarily", "temporary", "until ", "limited until")): return "Temporary_Spam_Accounts"
+        return "Spam_Accounts"
 
     async def worker(sess):
         sess_path = os.path.join(extract_dir, sess)
-        json_path = sess_path.replace('.session', '.json')
+        category = "Frozen_Sessions"
         async with semaphore:
             client = create_client(sess_path)
-            status = "Failed"
             try:
                 await client.connect()
                 if await client.is_user_authorized():
-                    await client.send_message('@spambot', '/start')
-                    for _ in range(8):
-                        await asyncio.sleep(0.5)
-                        async for msg in client.iter_messages('@spambot', limit=2):
-                            if not msg.out and msg.text:
-                                if "Good news" in msg.text or "no limits" in msg.text.lower(): status = "Spamfree"
-                                else: status = "Spam"
-                                break
-                        if status != "Failed": break
-                shutil.copy(sess_path, os.path.join(dirs[status], sess))
-                if os.path.exists(json_path): shutil.copy(json_path, os.path.join(dirs[status], os.path.basename(json_path)))
-            except: 
-                shutil.copy(sess_path, os.path.join(dirs['Failed'], sess))
-                if os.path.exists(json_path): shutil.copy(json_path, os.path.join(dirs['Failed'], os.path.basename(json_path)))
-            finally: await safe_disconnect(client)
+                    await client.send_message("@SpamBot", "/start")
+                    reply = None
+                    for _ in range(10):
+                        await asyncio.sleep(1)
+                        messages = await client.get_messages("@SpamBot", limit=4)
+                        reply = next((m.text for m in messages if not m.out and m.text), None)
+                        if reply: break
+                    category = classify(reply)
+                copy_session_bundle(sess_path, dirs[category])
+            except Exception:
+                copy_session_bundle(sess_path, dirs["Frozen_Sessions"])
+            finally:
+                await safe_disconnect(client)
         await tracker.advance()
 
-    await asyncio.gather(*(worker(s) for s in sessions))
-
-    for name, path in dirs.items():
-        if os.listdir(path):
-            zip_path = os.path.join(user_dir, f"{name}_Sessions.zip")
-            await asyncio.to_thread(create_zip, path, zip_path)
-            await call.message.answer_document(FSInputFile(zip_path))
-    await call.message.answer("✅ Spam check complete.", reply_markup=get_back_kb())
+    await asyncio.gather(*(worker(session) for session in data['sessions']))
+    sent = 0
+    for key, folder in dirs.items():
+        if any(path.endswith('.session') for path in os.listdir(folder)):
+            zip_path = os.path.join(user_dir, f"{key}.zip")
+            await asyncio.to_thread(create_zip, folder, zip_path)
+            await call.message.answer_document(FSInputFile(zip_path), caption=labels[key])
+            sent += 1
+    await call.message.answer(f"✅ Spam review complete. Created {sent} category package(s).", reply_markup=get_back_kb())
 
 async def process_check_age(call: CallbackQuery, state: FSMContext, status_msg: Message):
     data = await state.get_data()
@@ -769,102 +824,85 @@ async def device_sec_menu(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "device_manage_start")
 async def device_manager_start(call: CallbackQuery, state: FSMContext):
-    try: await call.answer()
-    except: pass
+    await call.answer()
     data = await state.get_data()
-    if not is_valid_data(data): return await call.message.edit_text("❌ Session expired. Upload zip again.")
-    await state.update_data(device_idx=0)
-    await show_device_page(call.message, state, edit=True)
-
-async def show_device_page(message: Message, state: FSMContext, edit=True):
-    data = await state.get_data()
-    sessions = data['sessions']
-    idx = data.get('device_idx', 0)
-    limit = 5 
-    
-    if idx >= len(sessions): return await message.edit_text("✅ End of device list.", reply_markup=get_back_kb())
-
-    page_sessions = sessions[idx:idx+limit]
-    result_text = ""
-    if edit: 
-        try: await message.edit_text("⏳ Compiling device data for next page...")
-        except: pass
-    
-    for i, sess in enumerate(page_sessions):
-        actual_acc_num = idx + i + 1
-        sess_path = os.path.join(data['extract_dir'], sess)
-        client = create_client(sess_path)
-        acc_info = f"📱 **Account {actual_acc_num} / {len(sessions)}**\n────────────────\n"
+    if not is_valid_data(data):
+        return await call.message.edit_text("❌ Session expired. Upload a session package again.")
+    await call.message.edit_text("⏳ Scanning every account and delivering each device report separately…")
+    for index, session in enumerate(data["sessions"], start=1):
+        session_path = os.path.join(data["extract_dir"], session)
+        client = create_client(session_path)
+        lines = [f"👤 Account {index}: unavailable"]
         try:
             await client.connect()
             if await client.is_user_authorized():
                 me = await client.get_me()
-                auths = await client(GetAuthorizationsRequest())
-                acc_info += f"👤 {me.first_name} (+`{me.phone}`)\n\n"
+                authorizations = await client(GetAuthorizationsRequest())
                 now = datetime.now(timezone.utc)
-                for auth in auths.authorizations:
-                    diff_hours = (now - auth.date_active).total_seconds() / 3600
-                    if auth.current: 
-                        acc_info += f"📍 Current Device: {auth.device_model} | Hash: `{auth.hash}`\n────────────────\n"
-                    else: 
-                        acc_info += f"• {auth.device_model}\n  └ {auth.country} | Hash: `{auth.hash}` | {diff_hours:.1f}h -> 👀 DETECTED\n"
-            else: acc_info += "❌ Session is dead.\n"
-        except: acc_info += f"❌ Error\n"
-        finally: await safe_disconnect(client)
-        result_text += acc_info + "\n"
-
-    btns = []
-    if idx + limit < len(sessions): btns.append([InlineKeyboardButton(text="⏭ Next Page", callback_data="device_next_page")])
-    btns.append([InlineKeyboardButton(text="🔙 Back", callback_data="device_sec_menu")])
-    
-    try:
-        if edit: await message.edit_text(result_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="Markdown")
-        else: await message.answer(result_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="Markdown")
-    except: pass
-
-@router.callback_query(F.data == "device_next_page")
-async def device_next_page(call: CallbackQuery, state: FSMContext):
-    try: await call.answer()
-    except: pass
-    data = await state.get_data()
-    await state.update_data(device_idx=data.get('device_idx', 0) + 5)
-    await show_device_page(call.message, state, edit=True)
+                lines = [f"👤 {display_account(me)}"]
+                current = next((auth for auth in authorizations.authorizations if auth.current), None)
+                if current:
+                    current_hours = max(0, (now - current.date_active).total_seconds() / 3600)
+                    lines.append(f"📍 Current Device: {current.device_model or 'Unknown device'} | {current_hours:.1f}h")
+                else:
+                    lines.append("📍 Current Device: Not reported")
+                lines.append("────────────────")
+                others = [auth for auth in authorizations.authorizations if not auth.current]
+                lines.extend(authorization_line(auth, now) for auth in others)
+                if not others:
+                    lines.append("✨ Removed: 0 other devices.")
+            else:
+                lines = [f"👤 Account {index}", "❌ Session is no longer authorized."]
+        except Exception as exc:
+            lines = [f"👤 Account {index}", f"❌ Device scan failed: {type(exc).__name__}."]
+        finally:
+            await safe_disconnect(client)
+        await call.message.answer("\n".join(lines))
+    await call.message.answer("✅ Device & Security scan complete.", reply_markup=get_back_kb())
 
 async def process_terminate_others(call: CallbackQuery, state: FSMContext, status_msg: Message):
     data = await state.get_data()
-    sessions = data['sessions']
-    tracker = ProgressTracker(status_msg, len(sessions), "Terminating Other Devices")
-    success, failed, locked_24h = 0, 0, 0
-    errors = set()
-    
-    async def worker(sess):
-        nonlocal success, failed, locked_24h
-        sess_path = os.path.join(data['extract_dir'], sess)
-        async with semaphore:
-            client = create_client(sess_path)
-            try:
-                await client.connect()
-                if await client.is_user_authorized():
-                    await client(ResetAuthorizationsRequest())
-                    success += 1
-                else: 
-                    failed += 1
-                    errors.add("Account is Dead")
-            except FreshResetAuthorisationForbiddenError:
-                locked_24h += 1
-            except Exception as e:
-                failed += 1
-                errors.add(type(e).__name__ + ": " + str(e))
-            finally: await safe_disconnect(client)
+    tracker = ProgressTracker(status_msg, len(data["sessions"]), "Terminating Other Devices")
+
+    async def worker(index, session):
+        session_path = os.path.join(data["extract_dir"], session)
+        client = create_client(session_path)
+        lines = [f"👤 Account {index}: unavailable"]
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                lines = [f"👤 Account {index}", "❌ Session is no longer authorized."]
+            else:
+                me = await client.get_me()
+                auths = await client(GetAuthorizationsRequest())
+                now = datetime.now(timezone.utc)
+                lines = [f"👤 {display_account(me)}"]
+                current = next((auth for auth in auths.authorizations if auth.current), None)
+                current_hours = max(0, (now - current.date_active).total_seconds() / 3600) if current else 0
+                lines += [f"📍 Current Device: {(current.device_model if current else 'Unknown device')} | {current_hours:.1f}h", "────────────────"]
+                removed = 0
+                for auth in auths.authorizations:
+                    if auth.current: continue
+                    try:
+                        await client(ResetAuthorizationRequest(hash=auth.hash))
+                        lines.append(authorization_line(auth, now, removed=True))
+                        removed += 1
+                    except FreshResetAuthorisationForbiddenError:
+                        lines.append(authorization_line(auth, now) + " (24h security hold)")
+                    except Exception as exc:
+                        lines.append(authorization_line(auth, now) + f" ({type(exc).__name__})")
+                lines.append(f"✨ Removed: {removed} other devices.")
+        except Exception as exc:
+            lines = [f"👤 Account {index}", f"❌ Device removal failed: {type(exc).__name__}."]
+        finally:
+            await safe_disconnect(client)
+        await call.message.answer("\n".join(lines))
         await tracker.advance()
 
-    await asyncio.gather(*(worker(s) for s in sessions))
-    
-    error_log = "\n".join(list(errors)[:3]) if errors else "None"
-    if locked_24h > 0:
-        await call.message.answer(f"✅ Bulk Termination Attempted.\n🟢 Success: {success}\n⏳ **Locked (24h Rule): {locked_24h}**\n🔴 Failed: {failed}\n\n⚠️ *Telegram blocked {locked_24h} account(s) because they are too new. You must wait 24 hours from login to terminate others.*", parse_mode="Markdown", reply_markup=get_back_kb())
-    else:
-        await call.message.answer(f"✅ Bulk Termination Complete.\n🟢 Success: {success}\n🔴 Failed: {failed}\n\n⚠️ **Errors:**\n`{error_log}`", parse_mode="Markdown", reply_markup=get_back_kb())
+    # Process sequentially so each per-account report is ordered and reliable.
+    for index, session in enumerate(data["sessions"], start=1):
+        await worker(index, session)
+    await call.message.answer("✅ Device termination process complete.", reply_markup=get_back_kb())
 
 @router.callback_query(F.data == "protect_device_prompt")
 async def protect_device_prompt(call: CallbackQuery, state: FSMContext):
@@ -1019,6 +1057,142 @@ async def execute_2fa_changes(trigger, state: FSMContext, status_msg: Message):
 
     msg = trigger.message if isinstance(trigger, CallbackQuery) else trigger
     await msg.answer(f"✅ 2FA Execution Complete.\n🟢 Success: {success}\n🔴 Failed: {failed}", reply_markup=get_back_kb())
+
+# ==========================================
+# 📝 PROFILE, EMAIL & BROADCAST OPERATIONS
+# ==========================================
+@router.callback_query(F.data == "bio_update_prompt")
+async def bio_update_prompt(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_valid_data(await state.get_data()): return await call.message.edit_text("❌ Session package expired. Please upload it again.")
+    await state.set_state(BotStates.waiting_for_bio)
+    await call.message.edit_text("📝 **Bio Update**\n\nEnter the bio you want to set:", parse_mode="Markdown", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_bio)
+async def bio_update_value(message: Message, state: FSMContext):
+    bio = (message.text or "").strip()
+    if not bio or len(bio) > 70: return await message.answer("❌ Enter a bio between 1 and 70 characters.", reply_markup=get_cancel_kb())
+    await state.update_data(new_bio=bio)
+    await state.set_state(BotStates.in_main_menu)
+    status = await message.answer("⏳ **Updating bios**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown")
+    await job_queue.put((message, state, "bio_update", status))
+
+@router.callback_query(F.data == "name_change_prompt")
+async def name_change_prompt(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_valid_data(await state.get_data()): return await call.message.edit_text("❌ Session package expired. Please upload it again.")
+    await state.set_state(BotStates.waiting_for_name_change)
+    await call.message.edit_text("🏷 **Enter the new name.**\nFormat: `FirstName` or `FirstName|LastName`\nExample: `John` or `John|Doe`", parse_mode="Markdown", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_name_change)
+async def name_change_value(message: Message, state: FSMContext):
+    values = [part.strip() for part in (message.text or "").split("|", 1)]
+    if not values[0] or len(values[0]) > 64 or (len(values) == 2 and len(values[1]) > 64):
+        return await message.answer("❌ Use `FirstName` or `FirstName|LastName` with valid names.", parse_mode="Markdown")
+    await state.update_data(new_first_name=values[0], new_last_name=values[1] if len(values) == 2 else "")
+    await state.set_state(BotStates.in_main_menu)
+    status = await message.answer("⏳ **Updating names**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown")
+    await job_queue.put((message, state, "name_change", status))
+
+async def process_profile_update(trigger, state, status_msg, *, about=None, first_name=None, last_name=None):
+    data = await state.get_data(); updated = os.path.join(data["user_dir"], "Updated_Sessions")
+    shutil.rmtree(updated, ignore_errors=True); os.makedirs(updated, exist_ok=True)
+    success = failed = 0; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Updating profiles")
+    async def worker(session):
+        nonlocal success, failed
+        path = os.path.join(data["extract_dir"], session); client = create_client(path)
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                kwargs = {k:v for k,v in {"about": about, "first_name": first_name, "last_name": last_name}.items() if v is not None}
+                await client(UpdateProfileRequest(**kwargs)); copy_session_bundle(path, updated); success += 1
+            else: failed += 1
+        except Exception: failed += 1
+        finally: await safe_disconnect(client)
+        await tracker.advance()
+    await asyncio.gather(*(worker(x) for x in data["sessions"]))
+    if success:
+        output = os.path.join(data["user_dir"], "Updated_Sessions.zip"); await asyncio.to_thread(create_zip, updated, output)
+        await trigger.answer_document(FSInputFile(output), caption=f"📦 Updated sessions • {success} successful • {failed} failed")
+    await trigger.answer(f"✅ Profile update complete.\n🟢 Success: {success}\n🔴 Failed: {failed}", reply_markup=get_back_kb())
+
+async def process_bio_update(trigger, state, status_msg):
+    await process_profile_update(trigger, state, status_msg, about=(await state.get_data())["new_bio"])
+
+async def process_name_change(trigger, state, status_msg):
+    data = await state.get_data()
+    await process_profile_update(trigger, state, status_msg, first_name=data["new_first_name"], last_name=data["new_last_name"])
+
+async def process_check_gmail(call, state, status_msg):
+    data = await state.get_data(); folders = {True: os.path.join(data["user_dir"], "Gmail_Added"), False: os.path.join(data["user_dir"], "No_Gmail")}
+    for folder in folders.values(): shutil.rmtree(folder, ignore_errors=True); os.makedirs(folder)
+    tracker = ProgressTracker(status_msg, len(data["sessions"]), "Checking Gmail connections")
+    async def worker(session):
+        path = os.path.join(data["extract_dir"], session); found = False; client = create_client(path)
+        try:
+            config_path = path[:-8] + ".json"
+            if os.path.exists(config_path):
+                with open(config_path, encoding="utf-8") as fh: found = bool(json.load(fh).get("email"))
+            await client.connect()
+            if await client.is_user_authorized() and not found:
+                password = await client(GetPasswordRequest())
+                found = bool(getattr(password, "email_unconfirmed_pattern", None))
+            copy_session_bundle(path, folders[found])
+        except Exception:
+            copy_session_bundle(path, folders[False])
+        finally: await safe_disconnect(client)
+        await tracker.advance()
+    await asyncio.gather(*(worker(x) for x in data["sessions"]))
+    for exists, label in ((True, "📧 Gmail Added"), (False, "📭 No Gmail Added")):
+        if any(name.endswith(".session") for name in os.listdir(folders[exists])):
+            output = os.path.join(data["user_dir"], "Gmail_Added.zip" if exists else "No_Gmail.zip")
+            await asyncio.to_thread(create_zip, folders[exists], output); await call.message.answer_document(FSInputFile(output), caption=label)
+    await call.message.answer("✅ Gmail check complete.", reply_markup=get_back_kb())
+
+@router.callback_query(F.data == "broadcast_menu")
+async def broadcast_menu(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 DM Broadcast", callback_data="broadcast_dm")], [InlineKeyboardButton(text="👥 Group Broadcast", callback_data="broadcast_group")], [InlineKeyboardButton(text="📢 DM/Group Broadcast", callback_data="broadcast_both")], [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]])
+    await call.message.edit_text("📢 **Broadcast System**\nChoose where the message should be delivered.", parse_mode="Markdown", reply_markup=kb)
+
+@router.callback_query(F.data.in_(["broadcast_dm", "broadcast_group", "broadcast_both"]))
+async def broadcast_select(call: CallbackQuery, state: FSMContext):
+    await call.answer(); await state.update_data(broadcast_mode=call.data.removeprefix("broadcast_")); await state.set_state(BotStates.waiting_for_broadcast_text)
+    await call.message.edit_text("💬 Enter the message you want to broadcast:", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_broadcast_text)
+async def broadcast_text(message: Message, state: FSMContext):
+    if not (message.text or "").strip(): return await message.answer("❌ The message cannot be empty.")
+    await state.update_data(broadcast_text=message.text); await state.set_state(BotStates.waiting_for_broadcast_delay)
+    await message.answer("⏱ Enter the delay in seconds between each message:", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_broadcast_delay)
+async def broadcast_delay(message: Message, state: FSMContext):
+    try: delay = float(message.text)
+    except ValueError: return await message.answer("❌ Enter a valid non-negative delay.")
+    if delay < 0 or delay > 3600: return await message.answer("❌ Delay must be between 0 and 3600 seconds.")
+    await state.update_data(broadcast_delay=delay); await state.set_state(BotStates.in_main_menu)
+    status = await message.answer("⏳ **Preparing broadcast**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown"); await job_queue.put((message, state, "broadcast", status))
+
+async def process_broadcast(trigger, state, status_msg):
+    data = await state.get_data(); success = failed = 0; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Delivering broadcast")
+    async def worker(session):
+        nonlocal success, failed
+        client = create_client(os.path.join(data["extract_dir"], session))
+        try:
+            await client.connect()
+            if not await client.is_user_authorized(): failed += 1; return
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                is_group = isinstance(entity, (Chat, Channel)) and bool(getattr(entity, "megagroup", False) or isinstance(entity, Chat))
+                is_dm = isinstance(entity, User) and not getattr(entity, "bot", False)
+                if (data["broadcast_mode"] in ("dm", "both") and is_dm) or (data["broadcast_mode"] in ("group", "both") and is_group):
+                    try: await client.send_message(entity, data["broadcast_text"]); success += 1; await asyncio.sleep(data["broadcast_delay"])
+                    except Exception: failed += 1
+        except Exception: failed += 1
+        finally: await safe_disconnect(client); await tracker.advance()
+    for session in data["sessions"]: await worker(session)
+    await trigger.answer(f"✅ Broadcast complete.\n🟢 Delivered: {success}\n🔴 Failed: {failed}", reply_markup=get_back_kb())
 
 # ==========================================
 # 💥 6. DESTROY & CLEAR CHATS & NEW SESSIONS
@@ -1868,7 +2042,7 @@ async def execute_mass_vc(call: CallbackQuery, state: FSMContext, status_msg: Me
     elif "joinchat/" in channel_link: invite_hash = channel_link.split("joinchat/")[-1].strip("/")
     
     target_vc = vc_link if vc_link.lower() != '/same' else channel_link
-    target_vc = target_vc.split("?")[0]
+    target_vc = target_vc.split("?")[0].rstrip("/")
 
     async def worker(sess):
         nonlocal success, failed
@@ -1878,27 +2052,31 @@ async def execute_mass_vc(call: CallbackQuery, state: FSMContext, status_msg: Me
             try:
                 await client.connect()
                 if await client.is_user_authorized():
-                    # 1. Join Chat first
+                    # Join the containing chat before requesting its active call.
                     try:
-                        if invite_hash: await client(ImportChatInviteRequest(invite_hash))
-                        else: await client(JoinChannelRequest(channel_link))
-                    except UserAlreadyParticipantError: pass
-                    
-                    # 2. Get Call Object
+                        if invite_hash:
+                            await client(ImportChatInviteRequest(invite_hash))
+                        else:
+                            await client(JoinChannelRequest(await client.get_input_entity(channel_link)))
+                    except (UserAlreadyParticipantError, InviteRequestSentError):
+                        pass
                     entity = await client.get_entity(target_vc)
                     full = await client(GetFullChannelRequest(entity))
                     call_obj = full.full_chat.call
-                    
-                    if call_obj:
-                        me = await client.get_me()
-                        await client(JoinGroupCallRequest(call=call_obj, join_as=await client.get_input_entity(me), params=DataJSON(data='{}'), muted=True, video_stopped=True))
-                        success += 1
-                        
-                        if delay > 0:
-                            await asyncio.sleep(delay)
-                            await client(LeaveGroupCallRequest(call=call_obj, source=0))
-                            await client(LeaveChannelRequest(entity))
-                    else: failed += 1
+                    if not call_obj:
+                        failed += 1
+                        return
+                    me = await client.get_me()
+                    updates = await client(JoinGroupCallRequest(call=call_obj, join_as=await client.get_input_entity(me), params=DataJSON(data='{}'), muted=True, video_stopped=True))
+                    success += 1
+                    if delay > 0:
+                        # The server allocates the participant source. Read it from the join update instead of
+                        # guessing, which was the reason delayed VC leaves previously failed.
+                        source = next((participant.source for update in getattr(updates, "updates", []) for participant in getattr(update, "participants", []) if getattr(participant, "peer", None) and getattr(participant, "source", None)), None)
+                        await asyncio.sleep(delay)
+                        if source is not None:
+                            await client(LeaveGroupCallRequest(call=call_obj, source=source))
+                        await client(LeaveChannelRequest(entity))
                 else: failed += 1
             except: failed += 1
             finally: await safe_disconnect(client)
@@ -1911,6 +2089,8 @@ async def execute_mass_vc(call: CallbackQuery, state: FSMContext, status_msg: Me
 # 🏁 APP START EXECUTION BLOCK
 # ==========================================
 async def main():
+    if bot is None:
+        raise RuntimeError("BOT_TOKEN environment variable is required.")
     print("Starting background workers...")
     for _ in range(3): asyncio.create_task(background_worker())
     print(f"{BRAND_NAME} Bot is successfully running...")
